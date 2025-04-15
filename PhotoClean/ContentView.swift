@@ -6,6 +6,7 @@
 //
 
 import SwiftUI
+import Vision
 
 struct ContentView: View {
     // State variables
@@ -20,8 +21,14 @@ struct ContentView: View {
     // Stores hash -> [URLs] for ALL images initially
     @State private var imageHashes: [String: [URL]] = [:]
     // Stores only the groups with count > 1
+    
     @State private var exactDuplicateGroups: [String: [URL]] = [:]
     
+    @State private var imageFeaturePrints: [URL: VNFeaturePrintObservation] = [:] // Stores the groups of near-duplicate URLs
+    @State private var nearDuplicateGroups: [[URL]] = [] // Array of arrays of URLs
+    
+    private let nearDuplicateThreshold: Float = 0.07 // Example Threshold
+
     var body: some View {
         NavigationView {
             VStack(spacing: 15) { // Adjusted spacing slightly
@@ -58,18 +65,26 @@ struct ContentView: View {
                             .font(.caption)
                     }
                     .padding(.horizontal)
-                } else if !exactDuplicateGroups.isEmpty {
-                    // Show results after analysis
-                    Text("Found \(exactDuplicateGroups.count) groups of exact duplicates (\(totalDuplicateFilesCount) files).")
-                        .font(.subheadline)
-                        .foregroundColor(.green)
+                } else if !exactDuplicateGroups.isEmpty || !nearDuplicateGroups.isEmpty { // Show if either has results
+                    // Consolidated results display
+                    VStack {
+                        if !exactDuplicateGroups.isEmpty {
+                            Text("Found \(exactDuplicateGroups.count) groups of exact duplicates (\(totalExactDuplicateFilesCount) files).") // Renamed computed var
+                                .font(.subheadline)
+                                .foregroundColor(.green)
+                        }
+                        if !nearDuplicateGroups.isEmpty {
+                             Text("Found \(nearDuplicateGroups.count) groups of near duplicates (\(totalNearDuplicateFilesCount) files).") // New computed var
+                                .font(.subheadline)
+                                .foregroundColor(.blue) // Different color maybe
+                        }
+                    }
                         .padding(.top, 5)
-                } else if selectedFolderURL != nil && !imageFileURLs.isEmpty && !isAnalyzing && exactDuplicateGroups.isEmpty && analysisMessage.contains("completed") {
-                    // Handle case where analysis finished but found no duplicates
-                    Text("No exact duplicates found.")
-                        .font(.subheadline)
-                        .foregroundColor(.orange)
-                        .padding(.top, 5)
+                } else if selectedFolderURL != nil && !imageFileURLs.isEmpty && !isAnalyzing && analysisMessage.contains("completed") {
+                    Text("No duplicates found.")
+                       .font(.subheadline)
+                       .foregroundColor(.orange)
+                       .padding(.top, 5)
                 }
                 
                 
@@ -87,12 +102,12 @@ struct ContentView: View {
                 .disabled(isAnalyzing) // Disable button during analysis
                 
                 // Placeholder for future results area (Phase 6+)
-                if !exactDuplicateGroups.isEmpty {
-                    Text("Review groups (coming soon)...")
-                        .font(.footnote)
-                        .foregroundColor(.secondary)
-                        .padding(.vertical)
-                }
+                if !exactDuplicateGroups.isEmpty || !nearDuplicateGroups.isEmpty {
+                                     Text("Review groups (coming soon)...")
+                                        .font(.footnote)
+                                        .foregroundColor(.secondary)
+                                        .padding(.vertical)
+                                }
                 
                 Spacer() // Pushes content
                 
@@ -105,7 +120,7 @@ struct ContentView: View {
                     // Start the analysis in a background task
                     // Pass the newValue to the analysis function
                     Task {
-                        await analyzeExactDuplicates(fileURLs: newValue)
+                        await startAnalysis(fileURLs: newValue)
                     }
                 } else {
                     // If file list becomes empty, clear analysis results
@@ -120,6 +135,14 @@ struct ContentView: View {
                            errorMessage: $pickerErrorMessage) // Pass the renamed binding
         }
     }
+    // --- Computed Properties for Counts ---
+   private var totalExactDuplicateFilesCount: Int {
+       exactDuplicateGroups.reduce(0) { $0 + $1.value.count }
+   }
+
+   private var totalNearDuplicateFilesCount: Int {
+       nearDuplicateGroups.reduce(0) { $0 + $1.count }
+   }
     
     // Helper computed property for total duplicate file count
     private var totalDuplicateFilesCount: Int {
@@ -145,6 +168,233 @@ struct ContentView: View {
     
     
     // --- Exact Duplicate Analysis Function ---
+    @MainActor
+        private func startAnalysis(fileURLs: [URL]) async {
+            guard !isAnalyzing else { return }
+
+            resetAnalysisState()
+            isAnalyzing = true
+            let totalFiles = fileURLs.count
+            guard totalFiles > 0 else {
+                 analysisMessage = "No files to analyze."
+                 isAnalyzing = false
+                 return
+            }
+            print("Starting analysis for \(totalFiles) files.")
+
+            // ===== Stage 1: Exact Duplicates (Hashing) =====
+            analysisMessage = "Stage 1/2: Finding exact duplicates..."
+            analysisProgress = 0.0 // Reset progress for stage 1
+
+            var hashes = [String: [URL]]()
+            var processedCountStage1 = 0
+
+            print("Starting exact duplicate analysis loop...")
+            for fileURL in fileURLs {
+                 // (Yielding logic as before)
+                 if processedCountStage1 % 5 == 0 { await Task.yield() }
+                 guard isAnalyzing else { break }
+
+                 print("Loop 1: Processing \(fileURL.lastPathComponent)")
+
+                 // (Load Data logic as before)
+                 var imageData: Data? = nil
+                 guard fileURL.startAccessingSecurityScopedResource() else {
+                     print("Loop 1 ERROR: Could not start access for \(fileURL.lastPathComponent). Skipping.")
+                     processedCountStage1 += 1 // Increment count even if skipped
+                     // Update progress reflecting skip
+                     let progress = Double(processedCountStage1) / Double(totalFiles) * 0.5 // Stage 1 is 50%
+                     await MainActor.run { updateProgress(progress: progress, message: "Stage 1/2: Analyzing \(processedCountStage1)/\(totalFiles) (Skipped Access)") }
+                     continue
+                 }
+                 do {
+                     defer { fileURL.stopAccessingSecurityScopedResource(); print("Loop 1: Stopped accessing \(fileURL.lastPathComponent)") }
+                     imageData = try Data(contentsOf: fileURL, options: .mappedIfSafe)
+                     print("Loop 1: Loaded data (\(imageData?.count ?? 0) bytes)")
+                 } catch {
+                     print("Loop 1 ERROR: Could not load data for \(fileURL.lastPathComponent): \(error)")
+                     imageData = nil
+                 }
+
+                // (Hashing logic using detached task as before)
+                var calculatedHash: String? = nil
+                if let dataToHash = imageData {
+                    calculatedHash = await Task.detached(priority: .userInitiated) {
+                        print("DETACHED 1: Hashing data from \(fileURL.lastPathComponent)")
+                        return ImageHasher.generatePixelHash(from: dataToHash)
+                    }.value
+                } else {
+                    print("Loop 1: Skipping hash for \(fileURL.lastPathComponent).")
+                }
+
+                if let hash = calculatedHash {
+                    hashes[hash, default: []].append(fileURL)
+                }
+
+                 // Update Progress for Stage 1 (0% to 50%)
+                 processedCountStage1 += 1
+                 let progress = Double(processedCountStage1) / Double(totalFiles) * 0.5 // Stage 1 is 50% of total
+                 await MainActor.run { updateProgress(progress: progress, message: "Stage 1/2: Analyzing \(processedCountStage1)/\(totalFiles)") }
+
+            } // End of exact duplicate loop
+
+            guard isAnalyzing else { print("Analysis cancelled during Stage 1."); resetAnalysisState(); return }
+
+            // Finalize Stage 1 results
+            let exactDups = hashes.filter { $1.count > 1 }
+            await MainActor.run {
+                 self.imageHashes = hashes // Store all hashes
+                 self.exactDuplicateGroups = exactDups
+                 print("Stage 1 complete. Found \(exactDups.count) exact duplicate groups.")
+            }
+
+
+            // ===== Stage 2: Near Duplicates (Vision Feature Prints) =====
+            await MainActor.run {
+                 analysisMessage = "Stage 2/2: Finding near duplicates..."
+                 // Keep progress at 0.5 initially for stage 2
+            }
+            print("Starting near duplicate analysis...")
+
+            // Identify unique images to process for feature prints:
+            // One representative from each exact duplicate group + all unique images (hash count == 1)
+            var representativeURLs: [URL] = []
+            var processedHashes = Set<String>() // Keep track of processed hashes
+
+            for (hash, urls) in hashes {
+                 if let firstURL = urls.first { // Take the first URL from the list
+                     representativeURLs.append(firstURL)
+                     processedHashes.insert(hash) // Mark this hash as covered
+                 }
+            }
+            print("Identified \(representativeURLs.count) representative images for Stage 2.")
+
+
+            // Generate Feature Prints for representative images
+            var featurePrints = [URL: VNFeaturePrintObservation]() // Temporary dict for this stage
+            var processedCountStage2 = 0
+            let totalStage2 = representativeURLs.count
+
+            guard totalStage2 > 0 else {
+                print("Stage 2: No representative images to analyze.")
+                await MainActor.run { finalizeAnalysis() } // Go straight to finalize
+                return
+            }
+
+            for fileURL in representativeURLs {
+                 if processedCountStage2 % 5 == 0 { await Task.yield() } // Yielding
+                 guard isAnalyzing else { break }
+
+                 print("Loop 2: Processing \(fileURL.lastPathComponent) for feature print.")
+
+                // (Load Data logic - REPEATED - Consider optimizing later by caching loaded data)
+                var imageData: Data? = nil
+                guard fileURL.startAccessingSecurityScopedResource() else {
+                    print("Loop 2 ERROR: Could not start access for \(fileURL.lastPathComponent). Skipping.")
+                    processedCountStage2 += 1
+                    let progress = 0.5 + (Double(processedCountStage2) / Double(totalStage2) * 0.5) // Stage 2 is 50%
+                     await MainActor.run { updateProgress(progress: progress, message: "Stage 2/2: Analyzing \(processedCountStage2)/\(totalStage2) (Skipped Access)") }
+                    continue
+                }
+                do {
+                    defer { fileURL.stopAccessingSecurityScopedResource(); print("Loop 2: Stopped accessing \(fileURL.lastPathComponent)") }
+                    imageData = try Data(contentsOf: fileURL, options: .mappedIfSafe)
+                    print("Loop 2: Loaded data (\(imageData?.count ?? 0) bytes)")
+                } catch {
+                    print("Loop 2 ERROR: Could not load data for \(fileURL.lastPathComponent): \(error)")
+                    imageData = nil
+                }
+
+                // Generate feature print using detached task
+                var calculatedPrint: VNFeaturePrintObservation? = nil
+                if let dataToProcess = imageData {
+                     calculatedPrint = await Task.detached(priority: .userInitiated) {
+                          print("DETACHED 2: Generating feature print for \(fileURL.lastPathComponent)")
+                          return await VisionService.generateFeaturePrint(from: dataToProcess)
+                     }.value
+                } else {
+                     print("Loop 2: Skipping feature print for \(fileURL.lastPathComponent).")
+                }
+
+                if let featurePrint = calculatedPrint {
+                     featurePrints[fileURL] = featurePrint // Store the print keyed by URL
+                }
+
+                // Update Progress for Stage 2 (50% to 100%)
+                processedCountStage2 += 1
+                let progress = 0.5 + (Double(processedCountStage2) / Double(totalStage2) * 0.5) // Stage 2 is 50%
+                 await MainActor.run { updateProgress(progress: progress, message: "Stage 2/2: Analyzing \(processedCountStage2)/\(totalStage2)") }
+
+            } // End of feature print generation loop
+
+            guard isAnalyzing else { print("Analysis cancelled during Stage 2."); resetAnalysisState(); return }
+
+            // --- Grouping Near Duplicates ---
+            print("Grouping near duplicates...")
+            var nearDups = [[URL]]()
+            var clusteredURLs = Set<URL>() // Keep track of URLs already put into a group
+
+            // Iterate through the representative URLs for which we got feature prints
+            let urlsWithPrints = Array(featurePrints.keys)
+
+            for i in 0..<urlsWithPrints.count {
+                let url1 = urlsWithPrints[i]
+                guard !clusteredURLs.contains(url1), let print1 = featurePrints[url1] else {
+                    continue // Skip if already clustered or no print available
+                }
+
+                var currentGroup: [URL] = [url1] // Start a new potential group
+
+                // Compare url1 with subsequent images
+                for j in (i + 1)..<urlsWithPrints.count {
+                    let url2 = urlsWithPrints[j]
+                    guard !clusteredURLs.contains(url2), let print2 = featurePrints[url2] else {
+                        continue // Skip if already clustered or no print
+                    }
+
+                    // Calculate distance
+                    if let distance = VisionService.calculateDistance(between: print1, and: print2) {
+                        // print("Distance between \(url1.lastPathComponent) and \(url2.lastPathComponent) = \(distance)") // Debug
+                        if distance < nearDuplicateThreshold { // Check against threshold
+                            print("Found near duplicate: \(url1.lastPathComponent) and \(url2.lastPathComponent) (Distance: \(distance))")
+                            currentGroup.append(url2)
+                            clusteredURLs.insert(url2) // Mark url2 as clustered
+                        }
+                    }
+                }
+
+                // If the group has more than one image, add it to the results
+                if currentGroup.count > 1 {
+                     clusteredURLs.insert(url1) // Mark url1 as clustered
+                     nearDups.append(currentGroup)
+                }
+            }
+            print("Stage 2 complete. Found \(nearDups.count) near duplicate groups.")
+
+            // --- Final State Update ---
+            await MainActor.run {
+                self.imageFeaturePrints = featurePrints // Store prints if needed later
+                self.nearDuplicateGroups = nearDups
+                finalizeAnalysis() // Call helper to set final state
+            }
+        }
+    // Helper to update progress and message safely on MainActor
+        @MainActor
+        private func updateProgress(progress: Double, message: String) {
+            guard isAnalyzing else { return }
+            self.analysisProgress = progress
+            self.analysisMessage = message
+            print("Progress: \(String(format: "%.1f", progress * 100))% - \(message)") // Log progress updates
+        }
+
+        // Helper to set final analysis state
+        @MainActor
+        private func finalizeAnalysis() {
+             isAnalyzing = false
+             analysisProgress = 1.0
+             analysisMessage = "Analysis completed."
+        }
+    
     @MainActor
     private func analyzeExactDuplicates(fileURLs: [URL]) async {
         guard !isAnalyzing else { return }
