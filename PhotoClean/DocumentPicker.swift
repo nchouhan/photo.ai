@@ -49,28 +49,66 @@ struct DocumentPicker: UIViewControllerRepresentable {
 
         // Delegate method called when the user selects a folder (or cancels)
         func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
-            guard let url = urls.first else {
-                parent.errorMessage = "Failed to get folder URL."
-                return // Should not happen if a folder is selected
-            }
+            guard let url = urls.first else { /* ... error handling ... */ return }
+            print("Coordinator: Received URL: \(url.path)")
 
-            // IMPORTANT: Request access to the folder's content
-            // We need to secure access before trying to read its contents
-            guard url.startAccessingSecurityScopedResource() else {
-                parent.errorMessage = "Permission denied: Could not access the selected folder. Please ensure the folder is in iCloud Drive or 'On My iPhone' and accessible."
-                print("Failed to start accessing security scoped resource: \(url.lastPathComponent)")
-                return
-            }
+            Task { // Delayed Task
+                print("Coordinator: Waiting for delay before access attempt...")
+                try? await Task.sleep(nanoseconds: 200_000_000) // 0.2 seconds
 
-            // Use a defer block to ensure we stop accessing the resource
-            // This executes when the current scope (this function) is exited
-            defer { url.stopAccessingSecurityScopedResource() }
+                print("Coordinator: Attempting initial access (after delay)...")
+                guard url.startAccessingSecurityScopedResource() else {
+                    // ... (Handle access failure as before: print, update parent, return) ...
+                    print("Coordinator ERROR: Failed initial access AFTER DELAY to \(url.lastPathComponent).")
+                    await MainActor.run {
+                        self.parent.errorMessage = "Could not access folder '\(url.lastPathComponent)'. Please check permissions or try selecting again."
+                        self.parent.selectedFolderURL = nil
+                        self.parent.imageFileURLs = []
+                    }
+                    return // Exit Task
+                }
 
-            // Update the selected folder URL in the parent view
-            parent.selectedFolderURL = url
+                // --- Access Succeeded ---
+                print("Coordinator: Initial access GRANTED (after delay).")
+                defer {
+                    url.stopAccessingSecurityScopedResource()
+                    print("Coordinator: Stopped initial access (after successful grant).")
+                }
 
-            // Find image files within the selected folder
-            findImageFiles(at: url)
+                // --- Save Bookmark Data (iOS Style - AFTER getting access) ---
+                do {
+                    let bookmarkData = try url.bookmarkData(options: [], // No scope option needed here
+                                                           includingResourceValuesForKeys: nil,
+                                                           relativeTo: nil)
+                    UserDefaults.standard.set(bookmarkData, forKey: "selectedFolderBookmark")
+                    UserDefaults.standard.set(url.lastPathComponent, forKey: "selectedFolderName") // Save name
+                    print("Coordinator: Bookmark data saved successfully.")
+                } catch {
+                    print("Coordinator ERROR: Failed to create bookmark data: \(error)")
+                    // Decide if this is critical. Maybe just warn the user?
+                    // Or update the error message on the parent view?
+                     await MainActor.run {
+                          self.parent.errorMessage = "Could access folder, but failed to save permission for next time."
+                     }
+                     // Clear any potentially old/invalid bookmark
+                     UserDefaults.standard.removeObject(forKey: "selectedFolderBookmark")
+                     UserDefaults.standard.removeObject(forKey: "selectedFolderName")
+                     // Continue with file listing anyway for this session...
+                }
+                // --- End Bookmark Saving ---
+
+                // Update parent URL for display (on main thread)
+                await MainActor.run {
+                     self.parent.selectedFolderURL = url
+                     self.parent.errorMessage = nil // Clear error if bookmark failed but access worked
+                }
+
+                // Find files
+                print("Coordinator: Proceeding to findImageFiles...")
+                self.findImageFiles(at: url)
+
+            } // End of Task
+            print("Coordinator: Delegate method finished (Task scheduled).")
         }
 
         // Delegate method called if the user cancels the picker
